@@ -1,0 +1,104 @@
+# QuantConnect Research Notebook - LightGBM SPY Classifier
+
+qb = QuantBook()
+
+# --- Imports ---
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.metrics import classification_report, accuracy_score, roc_auc_score
+from sklearn.model_selection import train_test_split
+from datetime import datetime
+
+# --- SETTINGS ---
+tickers = ['SPY', 'UVXY', 'TLT', 'UUP']  # ✅ All tradable ETFs
+start = datetime(2010, 1, 1)
+end = datetime(2023, 12, 31)
+
+# Add symbols
+symbols = {ticker: qb.AddEquity(ticker, Resolution.Daily).Symbol for ticker in tickers}
+symbol_list = list(symbols.values())
+
+# ✅ Bulk history request
+history_raw = qb.History(symbol_list, start, end, Resolution.Daily)
+
+# ✅ Pivot to get close prices: index = time, columns = Symbol.Value
+history = history_raw['close'].unstack(level=0)
+history.columns = [col.Value for col in history.columns]  # Convert Symbol objects to strings
+history.dropna(inplace=True)
+
+# --- FEATURE ENGINEERING ---
+df = pd.DataFrame(index=history.index)
+df['SPY'] = history['SPY']
+
+# Price-based features
+df['ret_1d'] = df['SPY'].pct_change()
+df['ret_5d'] = df['SPY'].pct_change(5)
+df['ret_10d'] = df['SPY'].pct_change(10)
+df['vol_20d'] = df['SPY'].pct_change().rolling(20).std()
+df['sma_20'] = df['SPY'].rolling(20).mean() / df['SPY']
+
+# RSI (14-day)
+delta = df['SPY'].diff()
+up, down = delta.clip(lower=0), -delta.clip(upper=0)
+roll_up = up.rolling(14).mean()
+roll_down = down.rolling(14).mean()
+rs = roll_up / (roll_down + 1e-9)
+df['rsi_14'] = 100 - (100 / (1 + rs))
+
+# Macro/Market indicators (daily returns)
+df['uvxy_ret'] = history['UVXY'].pct_change()
+df['tlt_ret'] = history['TLT'].pct_change()
+df['uup_ret'] = history['UUP'].pct_change()
+
+# Calendar features
+df['day_of_week'] = df.index.dayofweek
+df['month'] = df.index.month
+
+# Target: 1 if SPY next-day return > 0, else 0
+df['target'] = df['SPY'].pct_change().shift(-1)
+df['target'] = (df['target'] > 0).astype(int)
+
+# Drop rows with NaNs
+df.dropna(inplace=True)
+
+# --- TRAINING SETUP ---
+features = [
+    'ret_1d', 'ret_5d', 'ret_10d',
+    'vol_20d', 'sma_20', 'rsi_14',
+    'uvxy_ret', 'tlt_ret', 'uup_ret',
+    'day_of_week', 'month'
+]
+X = df[features]
+y = df['target']
+
+# Split without shuffle (preserve time order)
+X_train, X_test, y_train, y_test = train_test_split(X, y, shuffle=False, test_size=0.2)
+
+# --- LIGHTGBM TRAINING ---
+train_data = lgb.Dataset(X_train, label=y_train)
+
+params = {
+    'objective': 'binary',
+    'metric': 'binary_logloss',
+    'verbosity': -1
+}
+
+model = lgb.train(
+    params,
+    train_data,
+    num_boost_round=100
+)
+
+# --- EVALUATION ---
+y_pred = model.predict(X_test)
+y_pred_labels = (y_pred > 0.5).astype(int)
+
+print("✅ Model Evaluation:")
+print("Accuracy:", accuracy_score(y_test, y_pred_labels))
+print("AUC:", roc_auc_score(y_test, y_pred))
+print(classification_report(y_test, y_pred_labels))
+
+# --- SAVE MODEL FOR ALGORITHM USE ---
+model.save_model('lightgbm_model.txt')
+print("✅ Model saved to project root as 'lightgbm_model.txt'")
