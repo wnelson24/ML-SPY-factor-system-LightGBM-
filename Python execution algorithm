@@ -1,0 +1,88 @@
+from AlgorithmImports import *
+import lightgbm as lgb
+import pandas as pd
+import numpy as np
+
+class ML_SPY_Predictor(QCAlgorithm):
+    
+    def Initialize(self):
+        self.SetStartDate(2020, 1, 1)
+        self.SetEndDate(2023, 12, 31)
+        self.SetCash(100000)
+        
+        self.spy = self.AddEquity("SPY", Resolution.Daily).Symbol
+        self.uvxy = self.AddEquity("UVXY", Resolution.Daily).Symbol
+        self.tlt = self.AddEquity("TLT", Resolution.Daily).Symbol
+        self.uup = self.AddEquity("UUP", Resolution.Daily).Symbol
+        
+        self.symbols = [self.spy, self.uvxy, self.tlt, self.uup]
+        
+        self.model = lgb.Booster(model_file='lightgbm_model.txt')
+        self.last_prediction_date = None
+        
+        self.Schedule.On(self.DateRules.EveryDay(self.spy), self.TimeRules.AfterMarketOpen(self.spy, 10), self.Rebalance)
+        
+    def Rebalance(self):
+        # Prevent duplicate predictions
+        if self.Time.date() == self.last_prediction_date:
+            return
+        
+        # Get 40 days of history to compute all features
+        history = self.History(self.symbols, 40, Resolution.Daily).close.unstack(level=0)
+        if history.isnull().values.any():
+            self.Debug(" Missing data, skipping")
+            return
+        
+        df = pd.DataFrame(index=history.index)
+        df['SPY'] = history['SPY']
+        
+        try:
+            # --- Recreate training features ---
+            df['ret_1d'] = df['SPY'].pct_change()
+            df['ret_5d'] = df['SPY'].pct_change(5)
+            df['ret_10d'] = df['SPY'].pct_change(10)
+            df['vol_20d'] = df['SPY'].pct_change().rolling(20).std()
+            df['sma_20'] = df['SPY'].rolling(20).mean() / df['SPY']
+            
+            delta = df['SPY'].diff()
+            up, down = delta.clip(lower=0), -delta.clip(upper=0)
+            roll_up = up.rolling(14).mean()
+            roll_down = down.rolling(14).mean()
+            rs = roll_up / (roll_down + 1e-9)
+            df['rsi_14'] = 100 - (100 / (1 + rs))
+            
+            df['uvxy_ret'] = history['UVXY'].pct_change()
+            df['tlt_ret'] = history['TLT'].pct_change()
+            df['uup_ret'] = history['UUP'].pct_change()
+            df['day_of_week'] = df.index.dayofweek
+            df['month'] = df.index.month
+            
+        except Exception as e:
+            self.Debug(f" Feature error: {e}")
+            return
+        
+        df.dropna(inplace=True)
+        latest = df.iloc[-1:]
+        
+        features = [
+            'ret_1d', 'ret_5d', 'ret_10d',
+            'vol_20d', 'sma_20', 'rsi_14',
+            'uvxy_ret', 'tlt_ret', 'uup_ret',
+            'day_of_week', 'month'
+        ]
+        
+        if latest[features].isnull().any().any():
+            self.Debug(" Latest feature row has NaNs")
+            return
+        
+        x = latest[features].values
+        pred_prob = self.model.predict(x)[0]
+        self.last_prediction_date = self.Time.date()
+        
+        # Trade logic
+        if pred_prob > 0.5:
+            self.SetHoldings(self.spy, 1.0)
+            self.Debug(f" LONG SPY | Prob: {pred_prob:.3f} | {self.Time}")
+        else:
+            self.SetHoldings(self.spy, 0)
+            self.Debug(f" FLAT SPY | Prob: {pred_prob:.3f} | {self.Time}")
